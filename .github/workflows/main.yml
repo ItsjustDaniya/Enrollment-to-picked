@@ -1,0 +1,47 @@
+name: Refresh Batch Start to Picked date
+
+on:
+  schedule:
+    # 9:00 AM and 9:00 PM IST == 03:30 and 15:30 UTC
+    - cron: "30 3 * * *"
+    - cron: "30 15 * * *"
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Only two secrets are needed — everything else (Metabase URL, question id,
+      # FlyWheel sheet id/tab) is hardcoded in refresh_batch_pipeline.py.
+      - name: Run refresh
+        env:
+          METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python refresh_batch_pipeline.py
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Batch_Start_to_Picked_date
+          path: Batch_Start_to_Picked_date.xlsx
+          retention-days: 90
+
+      # Optional: also commit the refreshed file back into the repo so it has a
+      # stable URL/history. Remove this step if you'd rather only keep the
+      # workflow-artifact copy above.
+      - name: Commit refreshed workbook
+        run: |
+          git config user.name "batch-pipeline-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add Batch_Start_to_Picked_date.xlsx
+          git diff --cached --quiet || git commit -m "chore: refresh Batch Start to Picked date ($(date -u +%Y-%m-%dT%H:%MZ))"
+          git push
