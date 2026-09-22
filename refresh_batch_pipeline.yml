@@ -7,6 +7,9 @@ on:
     - cron: "30 15 * * *"
   workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
 
+permissions:
+  contents: write  # needed for the "Commit refreshed workbook" step to git push
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
@@ -44,4 +47,5 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add Batch_Start_to_Picked_date.xlsx
           git diff --cached --quiet || git commit -m "chore: refresh Batch Start to Picked date ($(date -u +%Y-%m-%dT%H:%MZ))"
-          git push
+          git pull --rebase origin "${{ github.ref_name }}"
+          git push origin HEAD:"${{ github.ref_name }}"
