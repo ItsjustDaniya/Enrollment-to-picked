@@ -2,8 +2,8 @@
 """
 refresh_batch_pipeline.py
 
-Rebuilds Batch_Start_to_Picked_date.xlsx end-to-end, twice a day, with no manual CSV
-upload step:
+Refreshes the "Batch Start to Picked date" tracker directly inside a Google Sheet,
+twice a day, with no manual CSV upload step and no separate .xlsx file to distribute:
 
   1. Batch Enrollment (Metabase) tab  <- Metabase REST API (saved question / native SQL),
                                           including the GEM / Non-GEM A-B split: any batch
@@ -11,18 +11,26 @@ upload step:
                                           gets 2 extra rows under it ("<batch> — GEM (A)",
                                           "<batch> — Non-GEM (B)") alongside its own
                                           unsplit total row.
-  2. Picked Students (raw) tab        <- Google Sheets API, pulling ONLY the columns
+  2. Picked Students (raw) tab        <- Google Sheets API, reading ONLY the columns
                                           needed from the FlyWheel tracker (UserID,
-                                          Batch, Status, Picked Date), tagged with each
-                                          user's GEM Status via a second Metabase query
-                                          so the A/B split also applies to Picked counts.
+                                          Batch, Type of Experience, Status, Picked
+                                          Date), tagged with each user's GEM Status via
+                                          a second Metabase query.
   3. Batch Start to Picked date tab   <- rebuilt with name-keyed INDEX/MATCH, "-" for
-                                          windows that haven't elapsed yet, "% of Currently
-                                          Enrolled", and the GEM(A)/Non-GEM(B) rows are
-                                          auto-inserted under their parent batch (TOTAL
-                                          only sums the unsplit rows, so nothing double-counts).
+                                          windows that haven't elapsed yet, "% of
+                                          Currently Enrolled", and the GEM(A)/Non-GEM(B)
+                                          rows auto-inserted under their parent batch
+                                          (TOTAL only sums the unsplit rows).
+  4. Batch Start-Picked (Freshers)    <- same layout, Picked Students filtered to
+     Batch Start-Picked (Unemployed)     FlyWheel "Type of Experience" = "Fresher" /
+                                          "Career Gap/ Non Working".
 
-Run twice daily from cron / GitHub Actions (see refresh_batch_pipeline.yml).
+All 5 tabs are written straight into the destination Google Sheet (OUTPUT_SHEET_ID
+below) via the Sheets API — each run clears and rewrites those tabs from scratch, so
+the sheet always reflects the latest Metabase + FlyWheel data. Formulas are written as
+live Google Sheets formulas (not baked-in values), so anyone can inspect/extend them.
+
+Run twice daily from cron / GitHub Actions (see .github/workflows/refresh_batch_pipeline.yml).
 
 Only two secrets are needed at runtime — everything else about *where* the data lives
 is hardcoded below in the CONFIG block, since it doesn't change run to run:
@@ -30,22 +38,18 @@ is hardcoded below in the CONFIG block, since it doesn't change run to run:
   METABASE_API_KEY             Metabase API key (Admin > Settings > Authentication > API Keys)
   GOOGLE_SERVICE_ACCOUNT_JSON   The service account's JSON key, either as a file path OR as the
                                  raw JSON text itself (both are accepted — see load below).
-                                 Share the FlyWheel sheet with that service account's
-                                 client_email as Viewer.
+                                 This service account needs:
+                                   - Viewer access to the FlyWheel sheet (reads Picked data)
+                                   - Editor access to the OUTPUT sheet (writes the 5 tabs)
 
-pip install requests google-api-python-client google-auth openpyxl
+pip install requests google-api-python-client google-auth
 """
-import csv
 import datetime as dt
 import os
 import sys
 import tempfile
 
 import requests
-import openpyxl
-from openpyxl.styles import Font, PatternFill
-from openpyxl.formatting.rule import ColorScaleRule
-from openpyxl.utils import get_column_letter, column_index_from_string
 
 # ----------------------------------------------------------------------------
 # CONFIG — fixed facts about this pipeline. Edit here, not via env vars, if any
@@ -61,17 +65,26 @@ METABASE_QUESTION_ID = 12957  # saved question "Batch Status" — re-run via /ap
 FLYWHEEL_SHEET_ID = "1Ue49enEEpgNaOEdQVgwgsehWvHb3HEI0Q-qekvAzYyU"
 FLYWHEEL_TAB_NAME = "Prog<>Placement"  # confirmed from the tab bar screenshot (gid=1147350782)
 
-OUTPUT_PATH = "Batch_Start_to_Picked_date.xlsx"
+# The Google Sheet this pipeline writes its output into (5 tabs, cleared & rewritten
+# each run). Must be shared with the service account's client_email as Editor.
+OUTPUT_SHEET_ID = "1hU8fx6qYS_A6RYHfG5n_O63Dr_AnsjcfrHFtGzHX3Xk"
+
+TAB_ENROLLMENT = "Batch Enrollment (Metabase)"
+TAB_PICKED = "Picked Students (raw)"
+TAB_MAIN_PIVOT = "Batch Start to Picked date"
+TAB_FRESHERS = "Batch Start-Picked (Freshers)"     # Excel/Sheets tab-name limit is 31 chars
+TAB_UNEMPLOYED = "Batch Start-Picked (Unemployed)"
 
 BATCH_TITLE_FILTER = "Professional Certificate Course In Data Science%"
 GEM_LABEL_IDS = (728, 729)  # technologies_label: 728 = GEM, 729 = Non-GEM
 
-# "Type of Experience" column in the Prog<>Placement tab — used for the two extra
-# Freshers / Unemployed "Batch Start to Picked date" views. Column letter and the
-# exact value spellings were confirmed against the live sheet.
+# "Type of Experience" column in the Prog<>Placement tab — used for the Freshers /
+# Unemployed views. Column letter and value spellings confirmed against the live sheet.
 TYPE_OF_EXPERIENCE_COLUMN = "I"
 FRESHER_VALUE = "Fresher"
 UNEMPLOYED_VALUE = "Career Gap/ Non Working"
+
+NWINDOWS = 18  # Within 30/60/.../540 Days
 
 # ----------------------------------------------------------------------------
 # Secrets — the only two things read from the environment.
@@ -152,7 +165,7 @@ def _metabase_query(sql):
 # 1. Metabase — Batch Enrollment, with the GEM/Non-GEM A-B split folded in
 # ----------------------------------------------------------------------------
 def fetch_enrollment_rows():
-    """Returns rows shaped for the workbook: for a batch with a real GEM+Non-GEM
+    """Returns rows shaped for the sheet: for a batch with a real GEM+Non-GEM
     split, 3 rows come out (unsplit original, "<batch> — GEM (A)", "<batch> —
     Non-GEM (B)"); every other batch comes out as a single unsplit row."""
     if METABASE_QUESTION_ID:
@@ -169,8 +182,6 @@ def fetch_enrollment_rows():
     if not raw_rows:
         raise RuntimeError("Metabase returned 0 enrollment rows — check the query/credentials.")
 
-    # Group by base batch name (gem_status may be missing entirely if the saved
-    # question hasn't been updated yet — treat that as "no split data available").
     by_batch = {}
     order = []
     for r in raw_rows:
@@ -220,23 +231,23 @@ def fetch_gem_map():
 
 
 # ----------------------------------------------------------------------------
-# 2. Google Sheets — Picked Students (raw), pulling only the needed columns
+# 2. Google Sheets — auth, and Picked Students (raw) read from FlyWheel
 # ----------------------------------------------------------------------------
-def fetch_picked_rows(target_batches, gem_map):
+def _sheets_service():
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
 
     creds = service_account.Credentials.from_service_account_file(
         GOOGLE_SERVICE_ACCOUNT_JSON,
-        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
-    service = build("sheets", "v4", credentials=creds)
+    return build("sheets", "v4", credentials=creds)
 
+
+def fetch_picked_rows(service, target_batches, gem_map):
     # Pull only the 5 columns we actually use instead of the whole 82-column sheet:
     # A=UserID, D=Batch, I=Type of Experience, U=Status, V=Picked Date (adjust letters
-    # if the FlyWheel sheet's column order changes — A/D/U/V match cols 0,3,20,21 in
-    # the CSV export this pipeline was originally built from; I was confirmed from a
-    # screenshot of the live sheet's "Type of Experience" column).
+    # if the FlyWheel sheet's column order changes).
     ranges = [
         f"'{FLYWHEEL_TAB_NAME}'!A2:A",
         f"'{FLYWHEEL_TAB_NAME}'!D2:D",
@@ -281,287 +292,166 @@ def fetch_picked_rows(target_batches, gem_map):
     return out
 
 
-def _build_experience_pivot(wb, sheet_name, target_value, base_batches, last_enroll_row,
-                             picked_batch_range, picked_date_range, picked_experience_range,
-                             header_font, header_fill, data_font, note_font):
-    """A simplified 'Batch Start to Picked date' view (no GEM/A-B columns) filtered to
-    Picked Students whose 'Type of Experience' equals target_value exactly."""
-    NAVY_BOLD = Font(name="Arial", bold=True)
-    NWINDOWS = 18
-    ws = wb.create_sheet(sheet_name)
-    headers = ["Batch", "Batch Start Date", "Initially Enrolled", "Currently Enrolled", "Picked Students"]
-    for w in range(NWINDOWS):
-        days = (w + 1) * 30
-        headers += [f"Within {days} Days", "% of Currently Enrolled"]
-    headers.append("Not Placed yet")
-    for j, h in enumerate(headers, start=1):
-        c = ws.cell(row=1, column=j, value=h)
-        c.font, c.fill = header_font, header_fill
+# ----------------------------------------------------------------------------
+# 3. Push helpers — write a tab's values into the OUTPUT sheet and format it
+# ----------------------------------------------------------------------------
+NAVY_RGB = {"red": 0.122, "green": 0.220, "blue": 0.392}
 
-    N_TAIL_ROWS = 9
-    data_rows = base_batches + [None] * N_TAIL_ROWS
-    first_data_row, last_data_row = 2, 2 + len(data_rows) - 1
 
-    enroll_range_name = f"'Batch Enrollment (Metabase)'!$A$2:$A${last_enroll_row}"
-    enroll_col = lambda letter: f"'Batch Enrollment (Metabase)'!${letter}$2:${letter}${last_enroll_row}"
-    target_lit = target_value.replace('"', '""')
+def _get_or_create_sheet(service, spreadsheet_id, title):
+    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    for s in meta["sheets"]:
+        if s["properties"]["title"] == title:
+            return s["properties"]["sheetId"]
+    resp = service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
+    ).execute()
+    return resp["replies"][0]["addSheet"]["properties"]["sheetId"]
 
-    for idx, r in enumerate(range(first_data_row, last_data_row + 1)):
-        src = data_rows[idx]
-        a_cell = ws.cell(row=r, column=1)
-        if src:
-            a_cell.value = src["batch_name"]
-        a_cell.font = data_font
-        Ar = f"$A{r}"
 
-        b = ws.cell(row=r, column=2,
-                    value=f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("D")},MATCH({Ar},{enroll_range_name},0)),""))')
-        b.font, b.number_format = data_font, "dd-mmm-yyyy"
+def _push_values(service, spreadsheet_id, title, values):
+    sheet_id = _get_or_create_sheet(service, spreadsheet_id, title)
+    # Clear the whole tab first so a shorter run doesn't leave stale rows behind.
+    service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=f"'{title}'").execute()
+    service.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id, range=f"'{title}'!A1",
+        valueInputOption="USER_ENTERED", body={"values": values},
+    ).execute()
+    return sheet_id
 
-        c_ = ws.cell(row=r, column=3,
-                     value=f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("E")},MATCH({Ar},{enroll_range_name},0)),""))')
-        c_.font = data_font
 
-        d_ = ws.cell(row=r, column=4,
-                     value=f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("F")},MATCH({Ar},{enroll_range_name},0)),""))')
-        d_.font = data_font
-
-        Dr, Br = f"$D{r}", f"$B{r}"
-
-        e_ = ws.cell(row=r, column=5,
-                     value=(f'=IF({Ar}="","",COUNTIFS({picked_batch_range},{Ar},'
-                            f'{picked_experience_range},"{target_lit}"))'))
-        e_.font = data_font
-
-        col_base = 5
-        for w in range(NWINDOWS):
-            days = (w + 1) * 30
-            within_col = col_base + 1 + w * 2
-            pct_col = within_col + 1
-            within_letter = get_column_letter(within_col)
-
-            within_formula = (
-                f'=IF({Ar}="","",IF({Br}="","",IF(TODAY()<{Br}+{days},"-",'
-                f'SUMPRODUCT(({picked_batch_range}={Ar})*({picked_experience_range}="{target_lit}")*'
-                f'({picked_date_range}<>"")*(({picked_date_range}-{Br})<{days})))))'
-            )
-            wcell = ws.cell(row=r, column=within_col, value=within_formula)
-            wcell.font = data_font
-
-            pct_formula = (
-                f'=IF({Ar}="","",IF({within_letter}{r}="-","-",'
-                f"IF({Dr}=0,0,{within_letter}{r}/{Dr})))"
-            )
-            pcell = ws.cell(row=r, column=pct_col, value=pct_formula)
-            pcell.font, pcell.number_format = data_font, "0%"
-
-        last_within_letter = get_column_letter(col_base + 1 + (NWINDOWS - 1) * 2)
-        np_cell = ws.cell(row=r, column=len(headers),
-                           value=f'=IF({Ar}="","",IF({last_within_letter}{r}="-","-",$E{r}-{last_within_letter}{r}))')
-        np_cell.font = data_font
-
-    total_row = last_data_row + 1
-    ws.cell(row=total_row, column=1, value="TOTAL").font = NAVY_BOLD
-    for letter in ("C", "D", "E"):
-        cell = ws.cell(row=total_row, column=column_index_from_string(letter),
-                        value=f"=SUM({letter}{first_data_row}:{letter}{last_data_row})")
-        cell.font = NAVY_BOLD
-    for w in range(NWINDOWS):
-        within_col = col_base + 1 + w * 2
-        pct_col = within_col + 1
-        wl = get_column_letter(within_col)
-        wcell = ws.cell(row=total_row, column=within_col,
-                         value=f"=SUM({wl}{first_data_row}:{wl}{last_data_row})")
-        wcell.font = NAVY_BOLD
-        pcell = ws.cell(row=total_row, column=pct_col,
-                         value=(f'=IF(SUM($D${first_data_row}:$D${last_data_row})=0,0,'
-                                f'{wl}{total_row}/SUM($D${first_data_row}:$D${last_data_row}))'))
-        pcell.font, pcell.number_format = NAVY_BOLD, "0%"
-    last_within_letter = get_column_letter(col_base + 1 + (NWINDOWS - 1) * 2)
-    ws.cell(row=total_row, column=len(headers),
-            value=f"=E{total_row}-{last_within_letter}{total_row}").font = NAVY_BOLD
-
-    ws.column_dimensions["A"].width = 62
-    ws.column_dimensions["B"].width = 14
-    for j in range(3, len(headers) + 1):
-        ws.column_dimensions[get_column_letter(j)].width = 13
-    ws.freeze_panes = "C2"
-
-    for w in range(NWINDOWS):
-        pct_col = col_base + 1 + w * 2 + 1
-        letter = get_column_letter(pct_col)
-        rng = f"{letter}{first_data_row}:{letter}{last_data_row}"
-        ws.conditional_formatting.add(rng, ColorScaleRule(
-            start_type="min", start_color="F8696B",
-            mid_type="percentile", mid_value=50, mid_color="FFEB84",
-            end_type="max", end_color="63BE7B"))
-    np_letter = get_column_letter(len(headers))
-    ws.conditional_formatting.add(f"{np_letter}{first_data_row}:{np_letter}{last_data_row}", ColorScaleRule(
-        start_type="min", start_color="63BE7B",
-        mid_type="percentile", mid_value=50, mid_color="FFEB84",
-        end_type="max", end_color="F8696B"))
-    ws.conditional_formatting.add(f"E{first_data_row}:E{last_data_row}", ColorScaleRule(
-        start_type="min", start_color="FFFFFFFF", end_type="max", end_color="FF9DC3E6"))
-
-    ws.cell(row=1, column=len(headers) + 2,
-            value=f'Filtered to Picked Students where "Type of Experience" = "{target_value}" '
-                  f'(FlyWheel column {TYPE_OF_EXPERIENCE_COLUMN}). Same "-" and % of Currently '
-                  f'Enrolled logic as the main tab.').font = note_font
+def _apply_formatting(service, spreadsheet_id, sheet_id, num_cols, num_data_rows,
+                       date_col=None, pct_cols=None):
+    requests_ = [
+        {  # bold white-on-navy header row
+            "repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                           "startColumnIndex": 0, "endColumnIndex": num_cols},
+                "cell": {"userEnteredFormat": {
+                    "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
+                    "backgroundColor": NAVY_RGB,
+                }},
+                "fields": "userEnteredFormat(textFormat,backgroundColor)",
+            }
+        },
+        {  # freeze header row
+            "updateSheetProperties": {
+                "properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 1}},
+                "fields": "gridProperties.frozenRowCount",
+            }
+        },
+    ]
+    if date_col is not None:
+        requests_.append({
+            "repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 1 + num_data_rows,
+                           "startColumnIndex": date_col, "endColumnIndex": date_col + 1},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "dd-mmm-yyyy"}}},
+                "fields": "userEnteredFormat.numberFormat",
+            }
+        })
+    for col in (pct_cols or []):
+        requests_.append({
+            "repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 1 + num_data_rows,
+                           "startColumnIndex": col, "endColumnIndex": col + 1},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0%"}}},
+                "fields": "userEnteredFormat.numberFormat",
+            }
+        })
+        requests_.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 1 + num_data_rows,
+                                 "startColumnIndex": col, "endColumnIndex": col + 1}],
+                    "gradientRule": {
+                        "minpoint": {"type": "MIN", "color": {"red": 0.973, "green": 0.412, "blue": 0.420}},
+                        "midpoint": {"type": "PERCENTILE", "value": "50",
+                                     "color": {"red": 1, "green": 0.922, "blue": 0.518}},
+                        "maxpoint": {"type": "MAX", "color": {"red": 0.388, "green": 0.745, "blue": 0.482}},
+                    },
+                },
+                "index": 0,
+            }
+        })
+    service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests_}).execute()
 
 
 # ----------------------------------------------------------------------------
-# 3. Build the workbook
+# 4. Build each tab's values (headers + rows of literal values / formula strings)
 # ----------------------------------------------------------------------------
-def build_workbook(enroll_rows, picked_rows, output_path):
-    NAVY, WHITE, GREY = "FF1F3864", "FFFFFFFF", "FF333333"
-    header_font = Font(name="Arial", bold=True, color=WHITE)
-    header_fill = PatternFill("solid", fgColor=NAVY, bgColor=GREY)
-    data_font = Font(name="Arial")
-    sub_font = Font(name="Arial", italic=True)
-    note_font = Font(name="Arial", italic=True, size=9, color="FF808080")
-    sub_fill = PatternFill("solid", fgColor="FFF4F7FC")
-
-    wb = openpyxl.Workbook()
-    wb.remove(wb.active)
-
-    # --- Batch Enrollment (Metabase) ---
-    ws1 = wb.create_sheet("Batch Enrollment (Metabase)")
-    headers1 = ["Batch", "Base Batch", "GEM Status", "Batch Start Date", "Initially Enrolled",
-                "Currently Enrolled", "Refund Requested", "Course Cancellation", "Deferred"]
-    for j, h in enumerate(headers1, start=1):
-        c = ws1.cell(row=1, column=j, value=h)
-        c.font, c.fill = header_font, header_fill
-    for i, row in enumerate(enroll_rows, start=2):
+def _enrollment_tab_values(enroll_rows):
+    headers = ["Batch", "Base Batch", "GEM Status", "Batch Start Date", "Initially Enrolled",
+               "Currently Enrolled", "Refund Requested", "Course Cancellation", "Deferred"]
+    rows = [headers]
+    for row in enroll_rows:
         start_date = row["batch_start_date"]
         if isinstance(start_date, str):
-            start_date = dt.datetime.fromisoformat(start_date.replace("Z", "+00:00")).replace(tzinfo=None)
-        is_sub = bool(row["gem_status"])
-        vals = [row["batch_name"], row["base_batch"], row["gem_status"], start_date,
-                int(row["initially_enrolled"]), int(row["currently_enrolled"]),
-                int(row["refund_requested"]), int(row["course_cancellation"]), int(row["deferred"])]
-        for j, v in enumerate(vals, start=1):
-            c = ws1.cell(row=i, column=j, value=v)
-            c.font = sub_font if is_sub else data_font
-            if is_sub:
-                c.fill = sub_fill
-            if j == 4:
-                c.number_format = "dd-mmm-yyyy"
-    last_enroll_row = len(enroll_rows) + 1
-    ws1.cell(row=1, column=11,
-              value=f"Source: Metabase (Newton School DB). GEM/Non-GEM split from technologies_label "
-                    f"ids 728/729. Refreshed: {dt.date.today().isoformat()}.").font = note_font
-    ws1.column_dimensions["A"].width = 62
-    ws1.column_dimensions["B"].width = 55
-    for col in "CDEFGHI":
-        ws1.column_dimensions[col].width = 16
-    ws1.freeze_panes = "A2"
+            start_date = start_date[:10]  # keep just YYYY-MM-DD, Sheets parses it as a date
+        rows.append([
+            row["batch_name"], row["base_batch"], row["gem_status"], start_date,
+            int(row["initially_enrolled"]), int(row["currently_enrolled"]),
+            int(row["refund_requested"]), int(row["course_cancellation"]), int(row["deferred"]),
+        ])
+    return rows
 
-    # --- Picked Students (raw) ---
-    ws2 = wb.create_sheet("Picked Students (raw)")
-    for j, h in enumerate(["UserID", "Batch", "Picked Date", "GEM Status", "Type of Experience"], start=1):
-        c = ws2.cell(row=1, column=j, value=h)
-        c.font, c.fill = header_font, header_fill
-    for i, (uid, batch, pdate_str, gem_status, experience_type) in enumerate(picked_rows, start=2):
+
+def _picked_tab_values(picked_rows):
+    headers = ["UserID", "Batch", "Picked Date", "GEM Status", "Type of Experience"]
+    rows = [headers]
+    for uid, batch, pdate_str, gem_status, experience_type in picked_rows:
         uid_val = int(uid) if str(uid).strip().isdigit() else uid
-        pdate = dt.datetime.strptime(pdate_str, "%Y-%m-%d") if pdate_str else None
-        ws2.cell(row=i, column=1, value=uid_val).font = data_font
-        ws2.cell(row=i, column=2, value=batch).font = data_font
-        c3 = ws2.cell(row=i, column=3, value=pdate)
-        c3.font = data_font
-        if pdate:
-            c3.number_format = "dd-mmm-yyyy"
-        ws2.cell(row=i, column=4, value=gem_status).font = data_font
-        ws2.cell(row=i, column=5, value=experience_type).font = data_font
-    last_picked_row = len(picked_rows) + 1
-    ws2.column_dimensions["A"].width = 14
-    ws2.column_dimensions["B"].width = 60
-    ws2.column_dimensions["C"].width = 14
-    ws2.column_dimensions["D"].width = 12
-    ws2.column_dimensions["E"].width = 26
-    ws2.freeze_panes = "A2"
-    ws2.cell(row=1, column=7,
-              value=f"Source: FlyWheel Google Sheet via Sheets API. GEM Status via Metabase label "
-                    f"mapping, Type of Experience via col {TYPE_OF_EXPERIENCE_COLUMN} of "
-                    f"'{FLYWHEEL_TAB_NAME}'. Refreshed: {dt.date.today().isoformat()}.").font = note_font
-    picked_experience_range = f"'Picked Students (raw)'!$E$2:$E${last_picked_row}"
+        rows.append([uid_val, batch, pdate_str, gem_status, experience_type])
+    return rows
 
-    # --- Batch Start to Picked date ---
-    ws3 = wb.create_sheet("Batch Start to Picked date")
-    NWINDOWS = 18
-    headers3 = ["Batch", "Batch (A/B)", "Base Batch", "GEM Status (raw)", "Batch Start Date",
-                "Initially Enrolled", "Currently Enrolled", "Picked Students"]
+
+def _main_pivot_values(enroll_rows, last_enroll_row, last_picked_row):
+    headers = ["Batch", "Batch (A/B)", "Base Batch", "GEM Status (raw)", "Batch Start Date",
+               "Initially Enrolled", "Currently Enrolled", "Picked Students"]
     for w in range(NWINDOWS):
-        days = (w + 1) * 30
-        headers3 += [f"Within {days} Days", "% of Currently Enrolled"]
-    headers3.append("Not Placed yet")
-    for j, h in enumerate(headers3, start=1):
-        c = ws3.cell(row=1, column=j, value=h)
-        c.font, c.fill = header_font, header_fill
+        headers += [f"Within {(w + 1) * 30} Days", "% of Currently Enrolled"]
+    headers.append("Not Placed yet")
 
     N_TAIL_ROWS = 9
     data_rows = enroll_rows + [None] * N_TAIL_ROWS
     first_data_row, last_data_row = 2, 2 + len(data_rows) - 1
 
-    enroll_range_name = f"'Batch Enrollment (Metabase)'!$A$2:$A${last_enroll_row}"
-    enroll_col = lambda letter: f"'Batch Enrollment (Metabase)'!${letter}$2:${letter}${last_enroll_row}"
-    picked_batch_range = f"'Picked Students (raw)'!$B$2:$B${last_picked_row}"
-    picked_date_range = f"'Picked Students (raw)'!$C$2:$C${last_picked_row}"
-    picked_gem_range = f"'Picked Students (raw)'!$D$2:$D${last_picked_row}"
+    enroll_range_name = f"'{TAB_ENROLLMENT}'!$A$2:$A${last_enroll_row}"
+    enroll_col = lambda letter: f"'{TAB_ENROLLMENT}'!${letter}$2:${letter}${last_enroll_row}"
+    picked_batch_range = f"'{TAB_PICKED}'!$B$2:$B${last_picked_row}"
+    picked_date_range = f"'{TAB_PICKED}'!$C$2:$C${last_picked_row}"
+    picked_gem_range = f"'{TAB_PICKED}'!$D$2:$D${last_picked_row}"
 
+    rows = [headers]
     for idx, r in enumerate(range(first_data_row, last_data_row + 1)):
         src = data_rows[idx]
-        is_sub = bool(src and src["gem_status"])
-        a_cell = ws3.cell(row=r, column=1)
-        if src:
-            a_cell.value = src["batch_name"]
-        a_cell.font = sub_font if is_sub else data_font
-        if is_sub:
-            a_cell.fill = sub_fill
-
         Ar = f"$A{r}"
+        row_vals = [src["batch_name"] if src else ""]
 
-        b = ws3.cell(row=r, column=2,
-                     value=(f'=IF({Ar}="","",IFERROR(IF(INDEX({enroll_col("C")},MATCH({Ar},{enroll_range_name},0))="GEM","A",'
-                            f'IF(INDEX({enroll_col("C")},MATCH({Ar},{enroll_range_name},0))="Non-GEM","B","")),""))'))
-        b.font = sub_font if is_sub else data_font
-        if is_sub:
-            b.fill = sub_fill
-
-        c_ = ws3.cell(row=r, column=3,
-                      value=f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("B")},MATCH({Ar},{enroll_range_name},0)),""))')
-        c_.font = sub_font if is_sub else data_font
-
-        d_ = ws3.cell(row=r, column=4,
-                      value=f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("C")},MATCH({Ar},{enroll_range_name},0)),""))')
-        d_.font = sub_font if is_sub else data_font
-
-        e = ws3.cell(row=r, column=5,
-                     value=f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("D")},MATCH({Ar},{enroll_range_name},0)),""))')
-        e.font = sub_font if is_sub else data_font
-        e.number_format = "dd-mmm-yyyy"
-
-        f_ = ws3.cell(row=r, column=6,
-                      value=f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("E")},MATCH({Ar},{enroll_range_name},0)),""))')
-        f_.font = sub_font if is_sub else data_font
-
-        g_ = ws3.cell(row=r, column=7,
-                      value=f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("F")},MATCH({Ar},{enroll_range_name},0)),""))')
-        g_.font = sub_font if is_sub else data_font
+        row_vals.append(
+            f'=IF({Ar}="","",IFERROR(IF(INDEX({enroll_col("C")},MATCH({Ar},{enroll_range_name},0))="GEM","A",'
+            f'IF(INDEX({enroll_col("C")},MATCH({Ar},{enroll_range_name},0))="Non-GEM","B","")),""))'
+        )
+        row_vals.append(f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("B")},MATCH({Ar},{enroll_range_name},0)),""))')
+        row_vals.append(f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("C")},MATCH({Ar},{enroll_range_name},0)),""))')
+        row_vals.append(f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("D")},MATCH({Ar},{enroll_range_name},0)),""))')
+        row_vals.append(f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("E")},MATCH({Ar},{enroll_range_name},0)),""))')
+        row_vals.append(f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("F")},MATCH({Ar},{enroll_range_name},0)),""))')
 
         BaseBatch, GemFilter = f"$C{r}", f"$D{r}"
-        Dr, Br, Er = f"$G{r}", f"$E{r}", f"$H{r}"
+        Dr, Br = f"$G{r}", f"$E{r}"
 
-        h_ = ws3.cell(row=r, column=8,
-                      value=(f'=IF({Ar}="","",IF({GemFilter}="",COUNTIF({picked_batch_range},{BaseBatch}),'
-                             f"COUNTIFS({picked_batch_range},{BaseBatch},{picked_gem_range},{GemFilter})))"))
-        h_.font = sub_font if is_sub else data_font
+        row_vals.append(
+            f'=IF({Ar}="","",IF({GemFilter}="",COUNTIF({picked_batch_range},{BaseBatch}),'
+            f"COUNTIFS({picked_batch_range},{BaseBatch},{picked_gem_range},{GemFilter})))"
+        )
 
-        col_base = 8
+        col_base = 8  # 1-indexed column of "Picked Students"
         for w in range(NWINDOWS):
             days = (w + 1) * 30
             within_col = col_base + 1 + w * 2
-            pct_col = within_col + 1
-            within_letter = get_column_letter(within_col)
+            within_letter = _col_letter(within_col)
 
             within_formula = (
                 f'=IF({Ar}="","",IF({Br}="","",IF(TODAY()<{Br}+{days},"-",'
@@ -570,98 +460,116 @@ def build_workbook(enroll_rows, picked_rows, output_path):
                 f'SUMPRODUCT(({picked_batch_range}={BaseBatch})*({picked_gem_range}={GemFilter})*({picked_date_range}<>"")*(({picked_date_range}-{Br})<{days}))'
                 f"))))"
             )
-            wcell = ws3.cell(row=r, column=within_col, value=within_formula)
-            wcell.font = sub_font if is_sub else data_font
+            row_vals.append(within_formula)
 
-            pct_formula = (
-                f'=IF({Ar}="","",IF({within_letter}{r}="-","-",'
-                f"IF({Dr}=0,0,{within_letter}{r}/{Dr})))"
-            )
-            pcell = ws3.cell(row=r, column=pct_col, value=pct_formula)
-            pcell.font = sub_font if is_sub else data_font
-            pcell.number_format = "0%"
-            if is_sub:
-                wcell.fill = sub_fill
-                pcell.fill = sub_fill
+            pct_formula = f'=IF({Ar}="","",IF({within_letter}{r}="-","-",IF({Dr}=0,0,{within_letter}{r}/{Dr})))'
+            row_vals.append(pct_formula)
 
-        last_within_letter = get_column_letter(col_base + 1 + (NWINDOWS - 1) * 2)
-        np_cell = ws3.cell(row=r, column=len(headers3),
-                            value=f'=IF({Ar}="","",IF({last_within_letter}{r}="-","-",{Er}-{last_within_letter}{r}))')
-        np_cell.font = sub_font if is_sub else data_font
-        if is_sub:
-            np_cell.fill = sub_fill
+        last_within_letter = _col_letter(col_base + 1 + (NWINDOWS - 1) * 2)
+        row_vals.append(f'=IF({Ar}="","",IF({last_within_letter}{r}="-","-",$H{r}-{last_within_letter}{r}))')
+        rows.append(row_vals)
 
     total_row = last_data_row + 1
-    ws3.cell(row=total_row, column=1, value="TOTAL").font = Font(name="Arial", bold=True)
     ab_range = f"$B${first_data_row}:$B${last_data_row}"
+    total_vals = ["TOTAL", "", "", "", ""]
     for letter in ("F", "G", "H"):
-        cell = ws3.cell(row=total_row, column=column_index_from_string(letter),
-                         value=f'=SUMIF({ab_range},"",{letter}{first_data_row}:{letter}{last_data_row})')
-        cell.font = Font(name="Arial", bold=True)
+        total_vals.append(f'=SUMIF({ab_range},"",{letter}{first_data_row}:{letter}{last_data_row})')
     for w in range(NWINDOWS):
-        within_col = 8 + 1 + w * 2
-        pct_col = within_col + 1
-        wl = get_column_letter(within_col)
-        wcell = ws3.cell(row=total_row, column=within_col,
-                          value=f'=SUMIF({ab_range},"",{wl}{first_data_row}:{wl}{last_data_row})')
-        wcell.font = Font(name="Arial", bold=True)
-        pcell = ws3.cell(row=total_row, column=pct_col,
-                          value=(f'=IF(SUMIF({ab_range},"",$G${first_data_row}:$G${last_data_row})=0,0,'
-                                 f'{wl}{total_row}/SUMIF({ab_range},"",$G${first_data_row}:$G${last_data_row}))'))
-        pcell.font = Font(name="Arial", bold=True)
-        pcell.number_format = "0%"
-    last_within_letter = get_column_letter(8 + 1 + (NWINDOWS - 1) * 2)
-    ws3.cell(row=total_row, column=len(headers3),
-              value=f"=H{total_row}-{last_within_letter}{total_row}").font = Font(name="Arial", bold=True)
+        within_col = col_base + 1 + w * 2
+        wl = _col_letter(within_col)
+        total_vals.append(f'=SUMIF({ab_range},"",{wl}{first_data_row}:{wl}{last_data_row})')
+        total_vals.append(
+            f'=IF(SUMIF({ab_range},"",$G${first_data_row}:$G${last_data_row})=0,0,'
+            f'{wl}{total_row}/SUMIF({ab_range},"",$G${first_data_row}:$G${last_data_row}))'
+        )
+    last_within_letter = _col_letter(col_base + 1 + (NWINDOWS - 1) * 2)
+    total_vals.append(f"=H{total_row}-{last_within_letter}{total_row}")
+    rows.append(total_vals)
 
-    ws3.column_dimensions["A"].width = 62
-    ws3.column_dimensions["B"].width = 11
-    ws3.column_dimensions["C"].width = 55
-    ws3.column_dimensions["D"].width = 13
-    ws3.column_dimensions["E"].width = 14
-    for j in range(6, len(headers3) + 1):
-        ws3.column_dimensions[get_column_letter(j)].width = 13
-    ws3.freeze_panes = "F2"
+    pct_cols_0based = [col_base + w * 2 + 1 for w in range(NWINDOWS)]  # 0-indexed
+    return rows, first_data_row, last_data_row, len(headers), pct_cols_0based
 
+
+def _experience_pivot_values(target_value, base_batches, last_enroll_row, last_picked_row):
+    headers = ["Batch", "Batch Start Date", "Initially Enrolled", "Currently Enrolled", "Picked Students"]
     for w in range(NWINDOWS):
-        pct_col = 8 + 1 + w * 2 + 1
-        letter = get_column_letter(pct_col)
-        rng = f"{letter}{first_data_row}:{letter}{last_data_row}"
-        ws3.conditional_formatting.add(rng, ColorScaleRule(
-            start_type="min", start_color="F8696B",
-            mid_type="percentile", mid_value=50, mid_color="FFEB84",
-            end_type="max", end_color="63BE7B"))
-    np_letter = get_column_letter(len(headers3))
-    ws3.conditional_formatting.add(f"{np_letter}{first_data_row}:{np_letter}{last_data_row}", ColorScaleRule(
-        start_type="min", start_color="63BE7B",
-        mid_type="percentile", mid_value=50, mid_color="FFEB84",
-        end_type="max", end_color="F8696B"))
-    ws3.conditional_formatting.add(f"H{first_data_row}:H{last_data_row}", ColorScaleRule(
-        start_type="min", start_color="FFFFFFFF", end_type="max", end_color="FF9DC3E6"))
+        headers += [f"Within {(w + 1) * 30} Days", "% of Currently Enrolled"]
+    headers.append("Not Placed yet")
 
-    # --- Batch Start to Picked Date (Freshers) / (Unemployed) ---
-    # Same batches as the main tab, but Picked Students / Within-N-Days are filtered to
-    # rows in "Picked Students (raw)" whose Type of Experience matches exactly. Uses the
-    # unsplit batch rows only (GEM/Non-GEM split is unrelated to experience type).
-    # Note: Excel caps sheet names at 31 characters, so "Batch Start to Picked Date
-    # (Freshers/Unemployed)" is shortened to "Batch Start-Picked (...)" — same tab,
-    # shorter title only.
-    base_batches_only = [row for row in enroll_rows if not row["gem_status"]]
-    _build_experience_pivot(
-        wb, "Batch Start-Picked (Freshers)", FRESHER_VALUE, base_batches_only,
-        last_enroll_row, picked_batch_range, picked_date_range, picked_experience_range,
-        header_font, header_fill, data_font, note_font,
-    )
-    _build_experience_pivot(
-        wb, "Batch Start-Picked (Unemployed)", UNEMPLOYED_VALUE, base_batches_only,
-        last_enroll_row, picked_batch_range, picked_date_range, picked_experience_range,
-        header_font, header_fill, data_font, note_font,
-    )
+    N_TAIL_ROWS = 9
+    data_rows = base_batches + [None] * N_TAIL_ROWS
+    first_data_row, last_data_row = 2, 2 + len(data_rows) - 1
 
-    wb.save(output_path)
-    return output_path
+    enroll_range_name = f"'{TAB_ENROLLMENT}'!$A$2:$A${last_enroll_row}"
+    enroll_col = lambda letter: f"'{TAB_ENROLLMENT}'!${letter}$2:${letter}${last_enroll_row}"
+    picked_batch_range = f"'{TAB_PICKED}'!$B$2:$B${last_picked_row}"
+    picked_date_range = f"'{TAB_PICKED}'!$C$2:$C${last_picked_row}"
+    picked_experience_range = f"'{TAB_PICKED}'!$E$2:$E${last_picked_row}"
+    target_lit = target_value.replace('"', '""')
+
+    col_base = 5  # 1-indexed column of "Picked Students"
+    rows = [headers]
+    for idx, r in enumerate(range(first_data_row, last_data_row + 1)):
+        src = data_rows[idx]
+        Ar = f"$A{r}"
+        row_vals = [src["batch_name"] if src else ""]
+        row_vals.append(f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("D")},MATCH({Ar},{enroll_range_name},0)),""))')
+        row_vals.append(f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("E")},MATCH({Ar},{enroll_range_name},0)),""))')
+        row_vals.append(f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("F")},MATCH({Ar},{enroll_range_name},0)),""))')
+
+        Dr, Br = f"$D{r}", f"$B{r}"
+        row_vals.append(
+            f'=IF({Ar}="","",COUNTIFS({picked_batch_range},{Ar},{picked_experience_range},"{target_lit}"))'
+        )
+
+        for w in range(NWINDOWS):
+            days = (w + 1) * 30
+            within_col = col_base + 1 + w * 2
+            within_letter = _col_letter(within_col)
+            within_formula = (
+                f'=IF({Ar}="","",IF({Br}="","",IF(TODAY()<{Br}+{days},"-",'
+                f'SUMPRODUCT(({picked_batch_range}={Ar})*({picked_experience_range}="{target_lit}")*'
+                f'({picked_date_range}<>"")*(({picked_date_range}-{Br})<{days})))))'
+            )
+            row_vals.append(within_formula)
+            pct_formula = f'=IF({Ar}="","",IF({within_letter}{r}="-","-",IF({Dr}=0,0,{within_letter}{r}/{Dr})))'
+            row_vals.append(pct_formula)
+
+        last_within_letter = _col_letter(col_base + 1 + (NWINDOWS - 1) * 2)
+        row_vals.append(f'=IF({Ar}="","",IF({last_within_letter}{r}="-","-",$E{r}-{last_within_letter}{r}))')
+        rows.append(row_vals)
+
+    total_row = last_data_row + 1
+    total_vals = ["TOTAL", ""]
+    for letter in ("C", "D", "E"):
+        total_vals.append(f"=SUM({letter}{first_data_row}:{letter}{last_data_row})")
+    for w in range(NWINDOWS):
+        within_col = col_base + 1 + w * 2
+        wl = _col_letter(within_col)
+        total_vals.append(f"=SUM({wl}{first_data_row}:{wl}{last_data_row})")
+        total_vals.append(
+            f'=IF(SUM($D${first_data_row}:$D${last_data_row})=0,0,'
+            f'{wl}{total_row}/SUM($D${first_data_row}:$D${last_data_row}))'
+        )
+    last_within_letter = _col_letter(col_base + 1 + (NWINDOWS - 1) * 2)
+    total_vals.append(f"=E{total_row}-{last_within_letter}{total_row}")
+    rows.append(total_vals)
+
+    pct_cols_0based = [col_base + w * 2 + 1 for w in range(NWINDOWS)]
+    return rows, first_data_row, last_data_row, len(headers), pct_cols_0based
 
 
+def _col_letter(n):
+    letters = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
 def main():
     print("Fetching enrollment data from Metabase (with GEM/Non-GEM split)...", file=sys.stderr)
     enroll_rows = fetch_enrollment_rows()
@@ -673,12 +581,44 @@ def main():
     gem_map = fetch_gem_map()
     print(f"  -> {len(gem_map)} tagged users", file=sys.stderr)
 
+    service = _sheets_service()
+
     print("Fetching Picked rows from the FlyWheel Google Sheet...", file=sys.stderr)
-    picked_rows = fetch_picked_rows(target_batches, gem_map)
+    picked_rows = fetch_picked_rows(service, target_batches, gem_map)
     print(f"  -> {len(picked_rows)} picked rows", file=sys.stderr)
 
-    print(f"Building {OUTPUT_PATH} ...", file=sys.stderr)
-    build_workbook(enroll_rows, picked_rows, OUTPUT_PATH)
+    last_enroll_row = len(enroll_rows) + 1
+    last_picked_row = len(picked_rows) + 1
+
+    print(f"Writing {TAB_ENROLLMENT} ...", file=sys.stderr)
+    enroll_values = _enrollment_tab_values(enroll_rows)
+    sid = _push_values(service, OUTPUT_SHEET_ID, TAB_ENROLLMENT, enroll_values)
+    _apply_formatting(service, OUTPUT_SHEET_ID, sid, len(enroll_values[0]), len(enroll_values) - 1, date_col=3)
+
+    print(f"Writing {TAB_PICKED} ...", file=sys.stderr)
+    picked_values = _picked_tab_values(picked_rows)
+    sid = _push_values(service, OUTPUT_SHEET_ID, TAB_PICKED, picked_values)
+    _apply_formatting(service, OUTPUT_SHEET_ID, sid, len(picked_values[0]), len(picked_values) - 1, date_col=2)
+
+    print(f"Writing {TAB_MAIN_PIVOT} ...", file=sys.stderr)
+    rows, first_r, last_r, ncols, pct_cols = _main_pivot_values(enroll_rows, last_enroll_row, last_picked_row)
+    sid = _push_values(service, OUTPUT_SHEET_ID, TAB_MAIN_PIVOT, rows)
+    _apply_formatting(service, OUTPUT_SHEET_ID, sid, ncols, last_r - first_r + 2, date_col=4, pct_cols=pct_cols)
+
+    base_batches_only = [row for row in enroll_rows if not row["gem_status"]]
+
+    print(f"Writing {TAB_FRESHERS} ...", file=sys.stderr)
+    rows, first_r, last_r, ncols, pct_cols = _experience_pivot_values(
+        FRESHER_VALUE, base_batches_only, last_enroll_row, last_picked_row)
+    sid = _push_values(service, OUTPUT_SHEET_ID, TAB_FRESHERS, rows)
+    _apply_formatting(service, OUTPUT_SHEET_ID, sid, ncols, last_r - first_r + 2, date_col=1, pct_cols=pct_cols)
+
+    print(f"Writing {TAB_UNEMPLOYED} ...", file=sys.stderr)
+    rows, first_r, last_r, ncols, pct_cols = _experience_pivot_values(
+        UNEMPLOYED_VALUE, base_batches_only, last_enroll_row, last_picked_row)
+    sid = _push_values(service, OUTPUT_SHEET_ID, TAB_UNEMPLOYED, rows)
+    _apply_formatting(service, OUTPUT_SHEET_ID, sid, ncols, last_r - first_r + 2, date_col=1, pct_cols=pct_cols)
+
     print("Done.", file=sys.stderr)
 
 
