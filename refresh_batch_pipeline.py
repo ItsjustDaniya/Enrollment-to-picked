@@ -71,6 +71,7 @@ OUTPUT_SHEET_ID = "1hU8fx6qYS_A6RYHfG5n_O63Dr_AnsjcfrHFtGzHX3Xk"
 
 TAB_ENROLLMENT = "Batch Enrollment (Metabase)"
 TAB_PICKED = "Picked Students (raw)"
+TAB_ROSTER = "FlyWheel Roster (raw)"
 TAB_MAIN_PIVOT = "Batch Start to Picked date"
 TAB_FRESHERS = "Batch Start-Picked (Freshers)"     # Excel/Sheets tab-name limit is 31 chars
 TAB_UNEMPLOYED = "Batch Start-Picked (Unemployed)"
@@ -83,6 +84,13 @@ GEM_LABEL_IDS = (728, 729)  # technologies_label: 728 = GEM, 729 = Non-GEM
 TYPE_OF_EXPERIENCE_COLUMN = "I"
 FRESHER_VALUE = "Fresher"
 UNEMPLOYED_VALUE = "Career Gap/ Non Working"
+
+# Heuristic used to compute "Currently Enrolled (cohort)" on the Freshers/Unemployed
+# tabs: a FlyWheel roster row is treated as no-longer-enrolled if its Status (col U)
+# CONTAINS any of these words (case-insensitive). FlyWheel's Status column wasn't
+# built for this (it's really a placement-pipeline stage, e.g. "Picked"), so this is
+# an approximation — adjust the keyword list here if it doesn't match reality.
+NOT_CURRENTLY_ENROLLED_STATUS_KEYWORDS = ("Refund", "Drop", "Cancel")
 
 NWINDOWS = 18  # Within 30/60/.../540 Days
 
@@ -292,6 +300,42 @@ def fetch_picked_rows(service, target_batches, gem_map):
     return out
 
 
+def fetch_roster_rows(service, target_batches):
+    """Every FlyWheel row for the target batches, regardless of placement Status —
+    used to count Initially/Currently Enrolled *per cohort* (Fresher, Unemployed,
+    etc.), since Metabase's enrollment numbers have no Type of Experience dimension."""
+    ranges = [
+        f"'{FLYWHEEL_TAB_NAME}'!A2:A",
+        f"'{FLYWHEEL_TAB_NAME}'!D2:D",
+        f"'{FLYWHEEL_TAB_NAME}'!{TYPE_OF_EXPERIENCE_COLUMN}2:{TYPE_OF_EXPERIENCE_COLUMN}",
+        f"'{FLYWHEEL_TAB_NAME}'!U2:U",
+    ]
+    result = service.spreadsheets().values().batchGet(
+        spreadsheetId=FLYWHEEL_SHEET_ID, ranges=ranges
+    ).execute()
+    value_ranges = result["valueRanges"]
+    user_ids = [r[0] if r else "" for r in value_ranges[0].get("values", [])]
+    batches = [r[0] if r else "" for r in value_ranges[1].get("values", [])]
+    experience_types = [r[0] if r else "" for r in value_ranges[2].get("values", [])]
+    statuses = [r[0] if r else "" for r in value_ranges[3].get("values", [])]
+
+    n = max(len(user_ids), len(batches), len(experience_types), len(statuses))
+
+    def get(lst, i):
+        return lst[i] if i < len(lst) else ""
+
+    out = []
+    for i in range(n):
+        batch = get(batches, i)
+        if batch not in target_batches:
+            continue
+        uid = get(user_ids, i)
+        experience_type = get(experience_types, i).strip()
+        status = get(statuses, i).strip()
+        out.append((uid, batch, experience_type, status))
+    return out
+
+
 # ----------------------------------------------------------------------------
 # 3. Push helpers — write a tab's values into the OUTPUT sheet and format it
 # ----------------------------------------------------------------------------
@@ -406,6 +450,15 @@ def _picked_tab_values(picked_rows):
     return rows
 
 
+def _roster_tab_values(roster_rows):
+    headers = ["UserID", "Batch", "Type of Experience", "Status"]
+    rows = [headers]
+    for uid, batch, experience_type, status in roster_rows:
+        uid_val = int(uid) if str(uid).strip().isdigit() else uid
+        rows.append([uid_val, batch, experience_type, status])
+    return rows
+
+
 def _main_pivot_values(enroll_rows, last_enroll_row, last_picked_row):
     headers = ["Batch", "Batch (A/B)", "Base Batch", "GEM Status (raw)", "Batch Start Date",
                "Initially Enrolled", "Currently Enrolled", "Picked Students"]
@@ -490,8 +543,9 @@ def _main_pivot_values(enroll_rows, last_enroll_row, last_picked_row):
     return rows, first_data_row, last_data_row, len(headers), pct_cols_0based
 
 
-def _experience_pivot_values(target_value, base_batches, last_enroll_row, last_picked_row):
-    headers = ["Batch", "Batch Start Date", "Initially Enrolled", "Currently Enrolled", "Picked Students"]
+def _experience_pivot_values(target_value, base_batches, last_enroll_row, last_picked_row, last_roster_row):
+    headers = ["Batch", "Batch Start Date", "Initially Enrolled (Cohort)", "Currently Enrolled (Cohort)",
+               "Picked Students"]
     for w in range(NWINDOWS):
         headers += [f"Within {(w + 1) * 30} Days", "% of Currently Enrolled"]
     headers.append("Not Placed yet")
@@ -505,8 +559,13 @@ def _experience_pivot_values(target_value, base_batches, last_enroll_row, last_p
     picked_batch_range = f"'{TAB_PICKED}'!$B$2:$B${last_picked_row}"
     picked_date_range = f"'{TAB_PICKED}'!$C$2:$C${last_picked_row}"
     picked_experience_range = f"'{TAB_PICKED}'!$E$2:$E${last_picked_row}"
+    roster_batch_range = f"'{TAB_ROSTER}'!$B$2:$B${last_roster_row}"
+    roster_experience_range = f"'{TAB_ROSTER}'!$C$2:$C${last_roster_row}"
+    roster_status_range = f"'{TAB_ROSTER}'!$D$2:$D${last_roster_row}"
     target_lit = target_value.replace('"', '""')
 
+    # "Currently Enrolled (Cohort)" = Initially Enrolled (Cohort) minus roster rows
+    # whose Status contains any of NOT_CURRENTLY_ENROLLED_STATUS_KEYWORDS (see CONFIG).
     col_base = 5  # 1-indexed column of "Picked Students"
     rows = [headers]
     for idx, r in enumerate(range(first_data_row, last_data_row + 1)):
@@ -514,8 +573,19 @@ def _experience_pivot_values(target_value, base_batches, last_enroll_row, last_p
         Ar = f"$A{r}"
         row_vals = [src["batch_name"] if src else ""]
         row_vals.append(f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("D")},MATCH({Ar},{enroll_range_name},0)),""))')
-        row_vals.append(f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("E")},MATCH({Ar},{enroll_range_name},0)),""))')
-        row_vals.append(f'=IF({Ar}="","",IFERROR(INDEX({enroll_col("F")},MATCH({Ar},{enroll_range_name},0)),""))')
+
+        initially_formula = (
+            f'=IF({Ar}="","",COUNTIFS({roster_batch_range},{Ar},{roster_experience_range},"{target_lit}"))'
+        )
+        row_vals.append(initially_formula)
+        currently_terms = "".join(
+            f'-COUNTIFS({roster_batch_range},{Ar},{roster_experience_range},"{target_lit}",{roster_status_range},"*{kw}*")'
+            for kw in NOT_CURRENTLY_ENROLLED_STATUS_KEYWORDS
+        )
+        currently_formula = (
+            f'=IF({Ar}="","",COUNTIFS({roster_batch_range},{Ar},{roster_experience_range},"{target_lit}"){currently_terms})'
+        )
+        row_vals.append(currently_formula)
 
         Dr, Br = f"$D{r}", f"$B{r}"
         row_vals.append(
@@ -587,8 +657,14 @@ def main():
     picked_rows = fetch_picked_rows(service, target_batches, gem_map)
     print(f"  -> {len(picked_rows)} picked rows", file=sys.stderr)
 
+    print("Fetching full FlyWheel roster (all statuses, for cohort Initially/Currently Enrolled)...",
+          file=sys.stderr)
+    roster_rows = fetch_roster_rows(service, target_batches)
+    print(f"  -> {len(roster_rows)} roster rows", file=sys.stderr)
+
     last_enroll_row = len(enroll_rows) + 1
     last_picked_row = len(picked_rows) + 1
+    last_roster_row = len(roster_rows) + 1
 
     print(f"Writing {TAB_ENROLLMENT} ...", file=sys.stderr)
     enroll_values = _enrollment_tab_values(enroll_rows)
@@ -600,6 +676,11 @@ def main():
     sid = _push_values(service, OUTPUT_SHEET_ID, TAB_PICKED, picked_values)
     _apply_formatting(service, OUTPUT_SHEET_ID, sid, len(picked_values[0]), len(picked_values) - 1, date_col=2)
 
+    print(f"Writing {TAB_ROSTER} ...", file=sys.stderr)
+    roster_values = _roster_tab_values(roster_rows)
+    sid = _push_values(service, OUTPUT_SHEET_ID, TAB_ROSTER, roster_values)
+    _apply_formatting(service, OUTPUT_SHEET_ID, sid, len(roster_values[0]), len(roster_values) - 1)
+
     print(f"Writing {TAB_MAIN_PIVOT} ...", file=sys.stderr)
     rows, first_r, last_r, ncols, pct_cols = _main_pivot_values(enroll_rows, last_enroll_row, last_picked_row)
     sid = _push_values(service, OUTPUT_SHEET_ID, TAB_MAIN_PIVOT, rows)
@@ -609,13 +690,13 @@ def main():
 
     print(f"Writing {TAB_FRESHERS} ...", file=sys.stderr)
     rows, first_r, last_r, ncols, pct_cols = _experience_pivot_values(
-        FRESHER_VALUE, base_batches_only, last_enroll_row, last_picked_row)
+        FRESHER_VALUE, base_batches_only, last_enroll_row, last_picked_row, last_roster_row)
     sid = _push_values(service, OUTPUT_SHEET_ID, TAB_FRESHERS, rows)
     _apply_formatting(service, OUTPUT_SHEET_ID, sid, ncols, last_r - first_r + 2, date_col=1, pct_cols=pct_cols)
 
     print(f"Writing {TAB_UNEMPLOYED} ...", file=sys.stderr)
     rows, first_r, last_r, ncols, pct_cols = _experience_pivot_values(
-        UNEMPLOYED_VALUE, base_batches_only, last_enroll_row, last_picked_row)
+        UNEMPLOYED_VALUE, base_batches_only, last_enroll_row, last_picked_row, last_roster_row)
     sid = _push_values(service, OUTPUT_SHEET_ID, TAB_UNEMPLOYED, rows)
     _apply_formatting(service, OUTPUT_SHEET_ID, sid, ncols, last_r - first_r + 2, date_col=1, pct_cols=pct_cols)
 
