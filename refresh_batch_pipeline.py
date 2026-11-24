@@ -56,6 +56,7 @@ import requests
 # of these ever change (new Metabase host, new saved question, sheet moved, etc).
 # ----------------------------------------------------------------------------
 METABASE_URL = "https://metabase-lierhfgoeiwhr.newtonschool.co"
+GEM_MAP_CARD_ID = 14044
 METABASE_DATABASE_ID = 4  # Newton School Postgres
 METABASE_QUESTION_ID = 12957  # saved question "Batch Status" — re-run via /api/card/12957/query
 # NOTE: question 12957's SQL must be updated to the GEM-split version in enrollment_query.sql
@@ -229,13 +230,29 @@ def fetch_enrollment_rows():
 
 
 def fetch_gem_map():
-    """(batch_name, user_id) -> 'GEM' | 'Non-GEM', used to tag Picked Students raw."""
-    try:
-        rows = _metabase_query(GEM_MAP_SQL)
-    except Exception as e:
-        print(f"  ! GEM map query failed ({e}) — Picked rows will be left untagged.", file=sys.stderr)
-        return {}
-    return {(r["batch_name"], str(r["user_id"])): r["gem_status"] for r in rows}
+    if GEM_MAP_CARD_ID:
+        resp = requests.post(f"{METABASE_URL}/api/card/{int(GEM_MAP_CARD_ID)}/query",
+                             headers={"X-API-Key": METABASE_API_KEY}, timeout=180)
+        resp.raise_for_status()
+        data = resp.json()["data"]
+        rows = [dict(zip([c["name"] for c in data["cols"]], r)) for r in data["rows"]]
+    else:
+        try:
+            rows = _metabase_query(GEM_MAP_SQL)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 403:
+                raise RuntimeError("Save gem_map_query.sql in Metabase and set GEM_MAP_CARD_ID. No tabs changed.") from exc
+            raise
+    result = {}
+    for r in rows:
+        key = (r["batch_name"], str(r["user_id"]))
+        tag = r["gem_status"]
+        if tag not in ("GEM", "Non-GEM"):
+            continue
+        if key in result and result[key] != tag:
+            raise RuntimeError(f"Conflicting GEM labels: {key}")
+        result[key] = tag
+    return result
 
 
 # ----------------------------------------------------------------------------
@@ -343,7 +360,8 @@ NAVY_RGB = {"red": 0.122, "green": 0.220, "blue": 0.392}
 
 
 def _get_or_create_sheet(service, spreadsheet_id, title):
-    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId,title))", includeGridData=False).execute(num_retries=3)
     for s in meta["sheets"]:
         if s["properties"]["title"] == title:
             return s["properties"]["sheetId"]
@@ -386,7 +404,7 @@ def _apply_formatting(service, spreadsheet_id, sheet_id, num_cols, num_data_rows
             }
         },
     ]
-    if date_col is not None:
+    if date_col is not None and num_data_rows > 0:
         requests_.append({
             "repeatCell": {
                 "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 1 + num_data_rows,
@@ -419,6 +437,24 @@ def _apply_formatting(service, spreadsheet_id, sheet_id, num_cols, num_data_rows
                 "index": 0,
             }
         })
+    if pct_cols:
+        meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(sheetId),conditionalFormats)", includeGridData=False).execute(num_retries=3)
+        existing = next((x.get("conditionalFormats", []) for x in meta.get("sheets", [])
+                         if x["properties"]["sheetId"] == sheet_id), [])
+        deletes = []
+        for i, rule in enumerate(existing):
+            g = rule.get("gradientRule", {})
+            rr = rule.get("ranges", [])
+            if (g.get("minpoint", {}).get("type") == "MIN"
+                and g.get("midpoint", {}).get("type") == "PERCENTILE"
+                and g.get("midpoint", {}).get("value") == "50"
+                and g.get("maxpoint", {}).get("type") == "MAX"
+                and len(rr) == 1 and rr[0].get("startRowIndex") == 1
+                and rr[0].get("startColumnIndex") in pct_cols
+                and rr[0].get("endColumnIndex") == rr[0].get("startColumnIndex") + 1):
+                deletes.append({"deleteConditionalFormatRule": {"sheetId": sheet_id, "index": i}})
+        requests_ = list(reversed(deletes)) + requests_
     service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests_}).execute()
 
 
@@ -648,7 +684,11 @@ def main():
     target_batches = {r["base_batch"] for r in enroll_rows}
 
     print("Fetching GEM/Non-GEM user-level mapping from Metabase...", file=sys.stderr)
-    gem_map = fetch_gem_map()
+    split_batches = {r["base_batch"] for r in enroll_rows if r["gem_status"]}
+    gem_map = fetch_gem_map() if split_batches else {}
+    missing = split_batches - {batch for batch, uid in gem_map}
+    if missing:
+        raise RuntimeError(f"Missing GEM mapping for {sorted(missing)}. No tabs changed.")
     print(f"  -> {len(gem_map)} tagged users", file=sys.stderr)
 
     service = _sheets_service()
@@ -663,8 +703,8 @@ def main():
     print(f"  -> {len(roster_rows)} roster rows", file=sys.stderr)
 
     last_enroll_row = len(enroll_rows) + 1
-    last_picked_row = len(picked_rows) + 1
-    last_roster_row = len(roster_rows) + 1
+    last_picked_row = max(2, len(picked_rows) + 1)
+    last_roster_row = max(2, len(roster_rows) + 1)
 
     print(f"Writing {TAB_ENROLLMENT} ...", file=sys.stderr)
     enroll_values = _enrollment_tab_values(enroll_rows)
