@@ -48,6 +48,9 @@ import datetime as dt
 import os
 import sys
 import tempfile
+import time
+import random
+from googleapiclient.errors import HttpError
 
 import requests
 
@@ -173,6 +176,11 @@ def _metabase_query(sql):
 # ----------------------------------------------------------------------------
 # 1. Metabase — Batch Enrollment, with the GEM/Non-GEM A-B split folded in
 # ----------------------------------------------------------------------------
+def normalize_tag(value):
+    tag = str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
+    return {"gem": "GEM", "non-gem": "Non-GEM", "nongem": "Non-GEM"}.get(tag, "")
+
+
 def fetch_enrollment_rows():
     """Returns rows shaped for the sheet: for a batch with a real GEM+Non-GEM
     split, 3 rows come out (unsplit original, "<batch> — GEM (A)", "<batch> —
@@ -198,7 +206,7 @@ def fetch_enrollment_rows():
         if bname not in by_batch:
             by_batch[bname] = {"": None, "GEM": None, "Non-GEM": None}
             order.append(bname)
-        gem_status = r.get("gem_status") or ""
+        gem_status = normalize_tag(r.get("gem_status"))
         by_batch[bname][gem_status if gem_status in ("GEM", "Non-GEM") else ""] = r
 
     out = []
@@ -243,10 +251,11 @@ def fetch_gem_map():
             if exc.response is not None and exc.response.status_code == 403:
                 raise RuntimeError("Save gem_map_query.sql in Metabase and set GEM_MAP_CARD_ID. No tabs changed.") from exc
             raise
+    print(f"  -> card {GEM_MAP_CARD_ID} returned {len(rows)} rows; labels: {sorted({str(r.get('gem_status')) for r in rows})}", file=sys.stderr)
     result = {}
     for r in rows:
         key = (r["batch_name"], str(r["user_id"]))
-        tag = r["gem_status"]
+        tag = normalize_tag(r["gem_status"])
         if tag not in ("GEM", "Non-GEM"):
             continue
         if key in result and result[key] != tag:
@@ -359,27 +368,64 @@ def fetch_roster_rows(service, target_batches):
 NAVY_RGB = {"red": 0.122, "green": 0.220, "blue": 0.392}
 
 
+def _execute(request):
+    for attempt in range(8):
+        try:
+            return request.execute()
+        except HttpError as exc:
+            if exc.resp.status not in (429, 500, 502, 503, 504) or attempt == 7:
+                raise
+            delay = min(120, 15 * 2 ** attempt) + random.uniform(0, 3)
+            print(f"Sheets HTTP {exc.resp.status}; retrying in {delay:.1f}s", file=sys.stderr)
+            time.sleep(delay)
+
+
 def _get_or_create_sheet(service, spreadsheet_id, title):
     meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id,
         fields="sheets(properties(sheetId,title))", includeGridData=False).execute(num_retries=3)
     for s in meta["sheets"]:
         if s["properties"]["title"] == title:
             return s["properties"]["sheetId"]
-    resp = service.spreadsheets().batchUpdate(
+    resp = _execute(service.spreadsheets().batchUpdate(
         spreadsheetId=spreadsheet_id,
         body={"requests": [{"addSheet": {"properties": {"title": title}}}]},
-    ).execute()
+    ))
     return resp["replies"][0]["addSheet"]["properties"]["sheetId"]
 
 
 def _push_values(service, spreadsheet_id, title, values):
     sheet_id = _get_or_create_sheet(service, spreadsheet_id, title)
-    # Clear the whole tab first so a shorter run doesn't leave stale rows behind.
-    service.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=f"'{title}'").execute()
-    service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id, range=f"'{title}'!A1",
-        valueInputOption="USER_ENTERED", body={"values": values},
-    ).execute()
+    meta = _execute(service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id, fields="sheets(properties(sheetId,gridProperties(rowCount,columnCount)))"))
+    grid = next(x["properties"]["gridProperties"] for x in meta["sheets"] if x["properties"]["sheetId"] == sheet_id)
+    nr = max(grid["rowCount"], len(values))
+    nc = max(grid["columnCount"], max(map(len, values)))
+    rows = []
+    for row in values:
+        cells = []
+        for v in row:
+            if v is None or v == "":
+                cells.append({})
+            elif isinstance(v, bool):
+                cells.append({"userEnteredValue": {"boolValue": v}})
+            elif isinstance(v, (int, float)):
+                cells.append({"userEnteredValue": {"numberValue": v}})
+            elif isinstance(v, str) and v.startswith("="):
+                cells.append({"userEnteredValue": {"formulaValue": v}})
+            else:
+                try:
+                    date = dt.date.fromisoformat(str(v))
+                    cell = {"numberValue": (date - dt.date(1899, 12, 30)).days}
+                except ValueError:
+                    cell = {"stringValue": str(v)}
+                cells.append({"userEnteredValue": cell})
+        rows.append({"values": cells})
+    reqs = []
+    if nr != grid["rowCount"] or nc != grid["columnCount"]:
+        reqs.append({"updateSheetProperties": {"properties": {"sheetId": sheet_id, "gridProperties": {"rowCount": nr, "columnCount": nc}}, "fields": "gridProperties(rowCount,columnCount)"}})
+    # updateCells clears uncovered values within the range atomically with the write.
+    reqs.append({"updateCells": {"range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": nr, "startColumnIndex": 0, "endColumnIndex": nc}, "rows": rows, "fields": "userEnteredValue"}})
+    _execute(service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": reqs}))
     return sheet_id
 
 
@@ -455,7 +501,7 @@ def _apply_formatting(service, spreadsheet_id, sheet_id, num_cols, num_data_rows
                 and rr[0].get("endColumnIndex") == rr[0].get("startColumnIndex") + 1):
                 deletes.append({"deleteConditionalFormatRule": {"sheetId": sheet_id, "index": i}})
         requests_ = list(reversed(deletes)) + requests_
-    service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests_}).execute()
+    _execute(service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests_}))
 
 
 # ----------------------------------------------------------------------------
@@ -685,7 +731,12 @@ def main():
 
     print("Fetching GEM/Non-GEM user-level mapping from Metabase...", file=sys.stderr)
     split_batches = {r["base_batch"] for r in enroll_rows if r["gem_status"]}
-    gem_map = fetch_gem_map() if split_batches else {}
+    print(f"  -> {len(split_batches)} split batches; fetching card {GEM_MAP_CARD_ID}", file=sys.stderr)
+    gem_map = fetch_gem_map()
+    if not gem_map:
+        raise RuntimeError("GEM card returned no valid tags; no tabs changed.")
+    if not split_batches:
+        print("WARNING: enrollment card 12957 returned no A/B split rows; verify its gem_status column.", file=sys.stderr)
     missing = split_batches - {batch for batch, uid in gem_map}
     if missing:
         raise RuntimeError(f"Missing GEM mapping for {sorted(missing)}. No tabs changed.")
