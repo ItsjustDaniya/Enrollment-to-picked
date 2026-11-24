@@ -468,39 +468,7 @@ def _apply_formatting(service, spreadsheet_id, sheet_id, num_cols, num_data_rows
                 "fields": "userEnteredFormat.numberFormat",
             }
         })
-        requests_.append({
-            "addConditionalFormatRule": {
-                "rule": {
-                    "ranges": [{"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 1 + num_data_rows,
-                                 "startColumnIndex": col, "endColumnIndex": col + 1}],
-                    "gradientRule": {
-                        "minpoint": {"type": "MIN", "color": {"red": 0.973, "green": 0.412, "blue": 0.420}},
-                        "midpoint": {"type": "PERCENTILE", "value": "50",
-                                     "color": {"red": 1, "green": 0.922, "blue": 0.518}},
-                        "maxpoint": {"type": "MAX", "color": {"red": 0.388, "green": 0.745, "blue": 0.482}},
-                    },
-                },
-                "index": 0,
-            }
-        })
-    if pct_cols:
-        meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id,
-            fields="sheets(properties(sheetId),conditionalFormats)", includeGridData=False).execute(num_retries=3)
-        existing = next((x.get("conditionalFormats", []) for x in meta.get("sheets", [])
-                         if x["properties"]["sheetId"] == sheet_id), [])
-        deletes = []
-        for i, rule in enumerate(existing):
-            g = rule.get("gradientRule", {})
-            rr = rule.get("ranges", [])
-            if (g.get("minpoint", {}).get("type") == "MIN"
-                and g.get("midpoint", {}).get("type") == "PERCENTILE"
-                and g.get("midpoint", {}).get("value") == "50"
-                and g.get("maxpoint", {}).get("type") == "MAX"
-                and len(rr) == 1 and rr[0].get("startRowIndex") == 1
-                and rr[0].get("startColumnIndex") in pct_cols
-                and rr[0].get("endColumnIndex") == rr[0].get("startColumnIndex") + 1):
-                deletes.append({"deleteConditionalFormatRule": {"sheetId": sheet_id, "index": i}})
-        requests_ = list(reversed(deletes)) + requests_
+    # Preserve existing conditional formatting; never fetch or append rules during refresh.
     _execute(service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests_}))
 
 
@@ -746,7 +714,7 @@ def main():
 
     print("Fetching Picked rows from the FlyWheel Google Sheet...", file=sys.stderr)
     picked_rows = fetch_picked_rows(service, target_batches, gem_map)
-    print(f"  -> {len(picked_rows)} picked rows", file=sys.stderr)
+    print(f"  -> {len(picked_rows)} picked rows; {sum(bool(r[3]) for r in picked_rows)} with GEM tags", file=sys.stderr)
 
     print("Fetching full FlyWheel roster (all statuses, for cohort Initially/Currently Enrolled)...",
           file=sys.stderr)
